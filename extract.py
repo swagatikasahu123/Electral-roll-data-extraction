@@ -1,335 +1,226 @@
 
 
-import os
-import re
-import zipfile
-import tempfile
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Electoral Roll Data Extraction Tool
+- Supports CLI (argparse) and GUI (tkinter)
+- Parses multi-column Hindi electoral PDFs using pdfplumber with regex heuristics
+- Consolidates to a single Excel
+
+Usage (CLI):
+  python extract.py --input "C:\folder\rolls" --output "C:\out\final_output.xlsx"
+
+GUI:
+  python extract.py --gui
+"""
+import os, re, sys, argparse, glob
+from typing import List
 import pandas as pd
-import pdfplumber
-import tkinter as tk
-from tkinter import filedialog, messagebox
 
-# ---------- Regex / heuristics ----------
-EPIC_REGEX = re.compile(r'\b[A-Z0-9]{5,}\b')
-AGE_REGEX = re.compile(r'\b([1-9][0-9]?)\b')
-GENDER_REGEX = re.compile(r'\b(M|F|m|f|पुरुष|महिला|स्त्री)\b', re.IGNORECASE)
-RELATION_TYPE_MAP = {
-    'S/O': 'Father', 'SON OF': 'Father', 'FATHER': 'Father',
-    'W/O': 'Husband', 'WIFE OF': 'Husband', 'HUSBAND': 'Husband',
-    'पिता': 'Father', 'पति': 'Husband'
-}
-VIDHAN_REGEX = re.compile(r'(\d+)\s*-\s*([^\n]+)')
-BOOTH_NO_REGEX = re.compile(r'भाग\s*[:\-]?\s*(\d+)', re.IGNORECASE)
-ST_CODE_REGEX = re.compile(r'\b(S\d{2})\b', re.IGNORECASE)
+# ---------- Normalization ----------
+def norm(s: str) -> str:
+    if not isinstance(s, str):
+        return s
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"[ \xa0]+", " ", s)
+    return s.replace("\u200c","").replace("\u200b","").strip()
 
-# ---------- Placeholder mappings (extend these) ----------
-ST_CODE_TO_STATE = {
-    "S04": "Bihar"
-}
-AC_NO_TO_NAME = {
-    "240": "Sikandra"
-}
-
-# ---------- Utilities ----------
-def maybe_unzip(path):
-    if path.lower().endswith(".zip") and os.path.isfile(path):
-        tempdir = tempfile.mkdtemp(prefix="eroll_")
-        with zipfile.ZipFile(path, "r") as z:
-            z.extractall(tempdir)
-        return tempdir
-    return path
-
-def normalize_gender(g):
-    if not g:
-        return None
-    g = g.strip().upper()
-    if g in ["M", "पुरुष"]:
-        return "M"
-    if g in ["F", "महिला", "स्त्री"]:
-        return "F"
+def norm_gender(g: str) -> str:
+    g = norm(g)
+    if "पुरुष" in g or "परुष" in g or "परुुष" in g:
+        return "Male"
+    if "महिला" in g or "मिहला" in g:
+        return "Female"
     return g
 
-def extract_header_metadata(first_page):
-    text = first_page.extract_text() or ""
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    state_name = ""
-    vidhan_name = ""
-    vidhan_number = ""
-    booth_name = ""
-    booth_number = ""
+# ---------- Regex ----------
+serial_epic_re = re.compile(r"^\s*(\d{1,4})\s+([A-Z]{2,4}[/A-Z0-9-]*\d{3,})\b")
+stop_tokens = r"(?:िनवार्चक का नाम|पिता का नाम|पित का नाम|पति का नाम|पत्नी का नाम|माता का नाम|मकान|उम्र|लिंग|\n)"
+name_re = re.compile(r"िनवार्चक का नाम\s*[:：]\s*(.+?)(?=\s*" + stop_tokens + r")")
+rel_re = re.compile(r"(पिता|पित|पति|पत्नी|माता)\s*(?:का\s*नाम)?\s*[:：]?\s*([^\n]+)")   # FIXED
+house_re = re.compile(r"मकान\s*स(?:ं|ंख्या|खं|ख्या)\s*[:：]?\s*(.+?)(?=\s*" + stop_tokens + r")")
+age_gender_re = re.compile(r"उम्र\s*[:：]?\s*(\d{1,3}).*?(?:लि?ं?ग)\s*[:：]?\s*([^\n]+)")
 
-    # ST_CODE
+# ---------- Helpers ----------
+def split_blocks(text: str) -> List[str]:
+    lines = text.splitlines()
+    blocks = []
+    current = []
     for line in lines:
-        m = ST_CODE_REGEX.search(line)
-        if m:
-            st_code = m.group(1)
-            state_name = ST_CODE_TO_STATE.get(st_code, "")
-            break
+        if serial_epic_re.match(line):
+            if current:
+                blocks.append("\n".join(current[:20]))
+                current = []
+        current.append(line)
+    if current:
+        blocks.append("\n".join(current[:20]))
+    return blocks
 
-    # Vidhan Sabha (AC) number & name
-    for line in lines:
-        m = VIDHAN_REGEX.search(line)
-        if m:
-            vidhan_number = m.group(1).strip()
-            vidhan_name = AC_NO_TO_NAME.get(vidhan_number, m.group(2).strip())
-            break
+# ---------- Parser ----------
+def parse_pdf(path: str) -> pd.DataFrame:
+    try:
+        import pdfplumber
+        with pdfplumber.open(path) as pdf:
+            pages_text = [norm(p.extract_text(x_tolerance=2, y_tolerance=2) or "") for p in pdf.pages]
+    except Exception:
+        import PyPDF2
+        reader = PyPDF2.PdfReader(open(path, "rb"))
+        pages_text = [norm(page.extract_text() or "") for page in reader.pages]
 
-    # Booth number
-    for line in lines:
-        m = BOOTH_NO_REGEX.search(line)
-        if m:
-            booth_number = m.group(1).strip()
-            break
+    header_text = "\n".join(pages_text[:3])
 
-    # Booth name (heuristic near मतदान केंद्र)
-    for i, line in enumerate(lines):
-        if "मतदान" in line or "केंद्र" in line:
-            for nxt in lines[i : i + 3]:
-                m = re.search(r'\d+\s*-\s*(.+)', nxt)
-                if m:
-                    booth_name = m.group(1).strip()
-                    break
-            if booth_name:
-                break
+    # State
+    state = "Bihar" if "बिहार" in header_text or "िबहार" in header_text else "Unknown"
 
-    # Fallbacks
-    if not state_name:
-        state_name = "UnknownState"
-    if not vidhan_name:
-        vidhan_name = "UnknownVidhanSabha"
-    if not vidhan_number:
-        vidhan_number = ""
-    if not booth_name:
-        booth_name = "UnknownBooth"
-    if not booth_number:
-        booth_number = ""
+    # Vidhan Sabha
+    m_vs = re.search(r"िवधानसभा[^:]*[:：]\s*([0-9]+)\s*-\s*([^\n(]+)", header_text)
+    vs_num, vs_name = (m_vs.group(1).strip(), norm(m_vs.group(2))) if m_vs else ("", "")
 
-    return {
-        "State Name": state_name,
-        "Vidhan sabha Name": vidhan_name,
-        "Vidhan sabha Number": vidhan_number,
-        "Booth Name": booth_name,
-        "Booth Number": booth_number
-    }
-
-def parse_voter_block(text, header_meta, source_pdf):
-    norm = re.sub(r'([A-Z0-9])\s+([A-Z0-9])', r'\1\2', text)  # collapse split EPIC
-    epic_m = EPIC_REGEX.search(norm)
-    epic_no = epic_m.group(0) if epic_m else None
-
-    gender_m = GENDER_REGEX.search(norm)
-    gender = normalize_gender(gender_m.group(1)) if gender_m else None
-
-    age = None
-    for a in re.findall(r'\b([1-9][0-9]?)\b', norm):
-        if 17 < int(a) < 121:
-            age = a
-            break
-
-    serial = None
-    mserial = re.match(r'^\s*(\d+)', norm)
-    if mserial:
-        serial = mserial.group(1)
-
-    relation_type = None
-    relation_name = None
-    for key, val in RELATION_TYPE_MAP.items():
-        if key.upper() in norm.upper():
-            relation_type = val
-            # try capture following name token(s)
-            m = re.search(rf'{re.escape(key)}\s+([A-Za-z\u0900-\u097F]+)', norm, re.IGNORECASE)
+    # Booth (Universal Regex)
+    booth_num, booth_name = "", ""
+    header_lines = header_text.splitlines()
+    for idx, line in enumerate(header_lines):
+        if re.search(r"(भाग\s*सं|भाग\s*संख्या|मतदान\s*कें?द्र|Booth\s*No)", line):
+            # Try same line
+            m = re.search(r"([0-9]+)\s*[-–]\s*([^\n]+)", line)
             if m:
-                relation_name = m.group(1)
-            break
-    # fallback Hindi explicit
-    if not relation_type:
-        if re.search(r'पिता', norm):
-            relation_type = "Father"
-        elif re.search(r'पति', norm):
-            relation_type = "Husband"
+                booth_num, booth_name = m.group(1).strip(), norm(m.group(2))
+                break
+            # Try next line
+            if idx + 1 < len(header_lines):
+                m2 = re.search(r"([0-9]+)\s*[-–]\s*([^\n]+)", header_lines[idx+1])
+                if m2:
+                    booth_num, booth_name = m2.group(1).strip(), norm(m2.group(2))
+                    break
 
-    # Voter name: English-first fallback to Hindi
-    fm_name_en = None
-    last_en = None
-    en_names = re.findall(r'\b([A-Z][a-z]+)\b', norm)
-    if len(en_names) >= 2:
-        fm_name_en = en_names[0]
-        last_en = en_names[1]
-    elif len(en_names) == 1:
-        fm_name_en = en_names[0]
-
-    fm_name_hi = None
-    last_hi = None
-    hi_names = re.findall(r'[\u0900-\u097F]+', norm)
-    if len(hi_names) >= 2:
-        fm_name_hi = hi_names[0]
-        last_hi = hi_names[1]
-    elif len(hi_names) == 1:
-        fm_name_hi = hi_names[0]
-
-    # House number
-    house = None
-    mh = re.search(r'(?:H\.?\s*No\.?:?\s*|मकान\s*सखंया\s*[:：]?\s*)(\w+)', norm, re.IGNORECASE)
-    if mh:
-        house = mh.group(1)
-
-    # Build voter's name
-    voter_name = None
-    if fm_name_en and last_en:
-        voter_name = f"{fm_name_en} {last_en}"
-    elif fm_name_hi and last_hi:
-        voter_name = f"{fm_name_hi} {last_hi}"
-    elif fm_name_en:
-        voter_name = fm_name_en
-    elif fm_name_hi:
-        voter_name = fm_name_hi
-
-    # Compose final structured dictionary
-    row = {
-        "State Name": header_meta.get("State Name"),
-        "Vidhan sabha Name & Number": f"{header_meta.get('Vidhan sabha Name','')} {header_meta.get('Vidhan sabha Number','')}".strip(),
-        "Booth Name & Number": f"{header_meta.get('Booth Name','')} {header_meta.get('Booth Number','')}".strip(),
-        "Voter's Serial Number": serial,
-        "Voter's Name": voter_name,
-        "Voter ID (EPIC Number)": epic_no,
-        "Relation's Name (Father's or Husband's)": relation_name,
-        "Relation Type (Father or Husband)": relation_type,
-        "House Number": house,
-        "Age": age,
-        "Gender": gender,
-        "Source PDF": os.path.basename(source_pdf)
-    }
-    return row
-
-def extract_from_pdf(pdf_path):
     rows = []
-    with pdfplumber.open(pdf_path) as pdf:
-        header_meta = {}
-        if pdf.pages:
-            header_meta = extract_header_metadata(pdf.pages[0])
-        for page in pdf.pages:
-            txt = page.extract_text() or ""
-            if not txt.strip():
+    for page_text in pages_text:
+        for block in split_blocks(page_text):
+            lines = [norm(x) for x in block.splitlines() if x.strip()]
+            if not lines: 
                 continue
-            lines = [l.strip() for l in txt.splitlines() if l.strip()]
-            block_accum = []
-            for line in lines:
-                if EPIC_REGEX.search(line):
-                    block_accum.append(line)
-                else:
-                    if block_accum:
-                        block_accum[-1] = block_accum[-1] + " " + line
-            for blk in block_accum:
-                row = parse_voter_block(blk, header_meta, pdf_path)
-                if row:
-                    rows.append(row)
-    return rows
+            m_head = serial_epic_re.match(lines[0])
+            if not m_head: 
+                continue
+            serial, epic = m_head.group(1), m_head.group(2)
+            body = "\n".join(lines[1:])
+            name = rel_name = house = age = gender = ""
+            rel_type = ""
 
-# ---------- Summaries & output ----------
-def build_summary(df):
-    def missing_critical(r):
-        return pd.isna(r["Voter ID (EPIC Number)"]) or pd.isna(r["Gender"]) or pd.isna(r["Age"])
-    summary = (
-        df.groupby("Source PDF")
-          .agg(
-              Voter_Count=("Voter's Name", "count"),
-              Missing_Critical=("Source PDF", lambda x: df.loc[x.index].apply(missing_critical, axis=1).sum()),
-              Unique_EPICs=("Voter ID (EPIC Number)", lambda s: s.dropna().nunique())
-          )
-          .reset_index()
-    )
-    return summary
+            # Name
+            mn = name_re.search(body) 
+            if mn: 
+                name = norm(mn.group(1))
+
+            # Relation (FIXED)
+            mr = rel_re.search(body)
+            if mr:
+                rel_name = norm(mr.group(2))
+                rk = mr.group(1)
+                if "पिता" in rk or "पित" in rk:
+                    rel_type = "Father"
+                elif "पति" in rk:
+                    rel_type = "Husband"
+                elif "पत्नी" in rk:
+                    rel_type = "Wife"
+                elif "माता" in rk:
+                    rel_type = "Mother"
+
+            # House
+            mh = house_re.search(body)
+            if mh:
+                house = norm(mh.group(1))
+                house = house.split("फोटो")[0].strip()
+
+            # Age/Gender
+            mag = age_gender_re.search(body)
+            if mag:
+                age = mag.group(1)
+                gender = norm_gender(mag.group(2))
+
+            rows.append({
+                "State Name": state,
+                "Vidhan sabha Name & Number": f"{vs_num}-{vs_name}" if vs_num else "",
+                "Booth Name & Number": f"{booth_num}-{booth_name}" if booth_num else "Not Found",
+                "Voter's Serial Number": serial,
+                "Voter's Name": name,
+                "Voter ID (EPIC Number)": epic,
+                "Relation's Name": rel_name,
+                "Relation Type": rel_type,
+                "House Number": re.findall(r"\d+", house)[-1] if re.findall(r"\d+", house) else house,
+                "Age": age,
+                "Gender": gender
+            })
+    return pd.DataFrame(rows)
+
+# ---------- Helpers for multiple files ----------
+def gather_pdfs(input_path: str) -> List[str]:
+    if os.path.isdir(input_path):
+        pdfs = sorted(glob.glob(os.path.join(input_path, "*.pdf")))
+    elif os.path.isfile(input_path) and input_path.lower().endswith(".pdf"):
+        pdfs = [input_path]
+    else:
+        pdfs = []
+    return pdfs
+
+def run_cli(args):
+    pdfs = gather_pdfs(args.input)
+    if not pdfs:
+        print("No PDFs found in input path.")
+        sys.exit(1)
+    frames = []
+    for p in pdfs:
+        df = parse_pdf(p)
+        frames.append(df)
+    out_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    os.makedirs(os.path.dirname(args.output), exist_ok=True) if os.path.dirname(args.output) else None
+    out_df.to_excel(args.output, index=False)
+    print(f"Saved: {args.output}")
 
 def run_gui():
-    root = tk.Tk()
-    root.title("Electoral Roll Data Extraction Tool")
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+    root = tk.Tk(); root.withdraw()
+    messagebox.showinfo("Electoral Extractor", "Select input PDF file or a folder containing PDFs")
+    input_path = filedialog.askopenfilename(title="Select a PDF (or Cancel to choose folder)", filetypes=[("PDF files","*.pdf")])
+    if not input_path:
+        input_path = filedialog.askdirectory(title="Select folder with PDFs")
+        if not input_path:
+            messagebox.showerror("Error", "No input selected."); return
+    pdfs = gather_pdfs(input_path)
+    if not pdfs:
+        messagebox.showerror("Error", "No PDFs found in the selection."); return
+    messagebox.showinfo("Output", "Choose where to save final_output.xlsx")
+    output_path = filedialog.asksaveasfilename(defaultextension=".xlsx", initialfile="final_output.xlsx", filetypes=[("Excel","*.xlsx")])
+    if not output_path:
+        messagebox.showerror("Error", "No output selected."); return
+    frames = []
+    try:
+        for p in pdfs:
+            frames.append(parse_pdf(p))
+        out_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        out_df.to_excel(output_path, index=False)
+        messagebox.showinfo("Success", f"Saved: {output_path}")
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
 
-    input_var = tk.StringVar()
-    output_var = tk.StringVar()
-
-    def choose_input():
-        p = filedialog.askopenfilename(title="Select ZIP or PDF") or filedialog.askdirectory(title="Or select folder")
-        input_var.set(p)
-
-    def choose_output():
-        p = filedialog.askdirectory(title="Select output folder")
-        output_var.set(p)
-
-    def execute():
-        inp = input_var.get()
-        out = output_var.get()
-        if not inp or not out:
-            messagebox.showerror("Error", "Both input and output must be provided.")
-            return
-        try:
-            resolved = maybe_unzip(inp)
-            pdfs = []
-            if os.path.isdir(resolved):
-                for root_dir, _, files in os.walk(resolved):
-                    for f in files:
-                        if f.lower().endswith(".pdf"):
-                            pdfs.append(os.path.join(root_dir, f))
-            elif os.path.isfile(resolved) and resolved.lower().endswith(".pdf"):
-                pdfs = [resolved]
-            else:
-                raise ValueError("Input must be PDF file/folder/ZIP.")
-
-            all_rows = []
-            for pdf in sorted(pdfs):
-                print(f"[=] Parsing {pdf}")
-                extracted = extract_from_pdf(pdf)
-                all_rows.extend(extracted)
-
-            if not all_rows:
-                messagebox.showwarning("No data", "No voter rows were extracted.")
-                return
-
-            df = pd.DataFrame(all_rows)
-            # reorder columns as requested (drop Source PDF in cleaned output if undesired)
-            cleaned_cols = [
-                "State Name",
-                "Vidhan sabha Name & Number",
-                "Booth Name & Number",
-                "Voter's Serial Number",
-                "Voter's Name",
-                "Voter ID (EPIC Number)",
-                "Relation's Name (Father's or Husband's)",
-                "Relation Type (Father or Husband)",
-                "House Number",
-                "Age",
-                "Gender"
-            ]
-            cleaned = df.reindex(columns=cleaned_cols + ["Source PDF"])  # keep source for summary
-
-            # Save cleaned voter-level
-            os.makedirs(out, exist_ok=True)
-            cleaned_path = os.path.join(out, "final_cleaned_output.xlsx")
-            cleaned.to_excel(cleaned_path, index=False)
-
-            # Summary per PDF
-            summary = build_summary(cleaned)
-            summary_path = os.path.join(out, "per_pdf_summary.xlsx")
-            summary.to_excel(summary_path, index=False)
-
-            messagebox.showinfo(
-                "Done",
-                f"Extraction complete.\nVoter-level: {cleaned_path}\nSummary: {summary_path}"
-            )
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
-    # GUI layout
-    tk.Label(root, text="Input ZIP / Folder / PDF:").grid(row=0, column=0, sticky="e", padx=5, pady=5)
-    tk.Entry(root, textvariable=input_var, width=50).grid(row=0, column=1)
-    tk.Button(root, text="Browse", command=choose_input).grid(row=0, column=2, padx=5)
-
-    tk.Label(root, text="Output Folder:").grid(row=1, column=0, sticky="e", padx=5, pady=5)
-    tk.Entry(root, textvariable=output_var, width=50).grid(row=1, column=1)
-    tk.Button(root, text="Browse", command=choose_output).grid(row=1, column=2, padx=5)
-
-    tk.Button(root, text="Run Extraction", command=execute, bg="#2563EB", fg="white", padx=12, pady=6).grid(row=2, column=1, pady=12)
-
-    root.mainloop()
+def main():
+    parser = argparse.ArgumentParser(description="Electoral Roll Data Extraction Tool (PDF ➜ Excel)")
+    parser.add_argument("--input", type=str, help="Input PDF file or folder path")
+    parser.add_argument("--output", type=str, help="Output Excel file path (e.g., C:\\out\\final_output.xlsx)")
+    parser.add_argument("--gui", action="store_true", help="Launch GUI mode")
+    args = parser.parse_args()
+    if args.gui:
+        run_gui(); return
+    if not args.input or not args.output:
+        parser.print_help(); sys.exit(1)
+    run_cli(args)
 
 if __name__ == "__main__":
-    run_gui()
+    main()
+
+
+
+
+
